@@ -18,15 +18,17 @@ Configuration (environment variables):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
-import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -39,6 +41,8 @@ except ImportError:
 BASE_URL: str = os.environ.get("PAPERCLIP_BASE_URL", "http://localhost:3100/api").rstrip("/")
 API_KEY: str  = os.environ.get("PAPERCLIP_API_KEY", "")
 COMPANY: str  = os.environ.get("PAPERCLIP_COMPANY_ID", "")
+AGENT_ID: str = os.environ.get("PAPERCLIP_AGENT_ID", "").strip()
+HEARTBEAT_WEBHOOK_SECRET: str = os.environ.get("PAPERCLIP_HEARTBEAT_WEBHOOK_SECRET", "")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -53,15 +57,24 @@ log = logging.getLogger(__name__)
 # ── HTTP client ────────────────────────────────────────────────────────────────
 
 _HTTP_TIMEOUT = 30  # seconds
+_HEARTBEAT_WAIT_TIMEOUT = 15  # seconds to wait for Paperclip to deliver a run to the webhook
+
+# A mutation is kept inside one heartbeat run at a time.  The HTTP adapter
+# calls the webhook below and remains pending until the mutation is complete.
+_mutation_lock = asyncio.Lock()
+_run_events: dict[str, asyncio.Event] = {}
+_run_events_lock = asyncio.Lock()
 
 
-def _headers() -> dict[str, str]:
-    """Build per-request headers.  Omit X-Paperclip-Run-Id — a fake UUID causes
-    FK violations against heartbeat_runs when the API logs activity."""
-    return {
+def _headers(run_id: str | None = None) -> dict[str, str]:
+    """Build API headers, attaching only a real Paperclip heartbeat run ID."""
+    headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
     }
+    if run_id:
+        headers["X-Paperclip-Run-Id"] = run_id
+    return headers
 
 
 def _err(message: str, status: int | None = None) -> dict[str, Any]:
@@ -78,6 +91,7 @@ async def _request(
     *,
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
+    run_id: str | None = None,
 ) -> Any:
     url = f"{BASE_URL}{path}"
     try:
@@ -85,7 +99,7 @@ async def _request(
             r = await client.request(
                 method,
                 url,
-                headers=_headers(),
+                headers=_headers(run_id),
                 params=params,
                 json=body,
             )
@@ -129,6 +143,70 @@ async def _delete(path: str) -> Any:
     return await _request("DELETE", path)
 
 
+async def _wait_for_run_webhook(run_id: str) -> bool:
+    """Wait until Paperclip has delivered this run to the HTTP adapter route."""
+    deadline = asyncio.get_running_loop().time() + _HEARTBEAT_WAIT_TIMEOUT
+    while asyncio.get_running_loop().time() < deadline:
+        async with _run_events_lock:
+            if run_id in _run_events:
+                return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def _start_mutation_run() -> str | dict[str, Any]:
+    """Start and bind a real Paperclip heartbeat run for one mutation."""
+    if not HEARTBEAT_WEBHOOK_SECRET:
+        return _err("PAPERCLIP_HEARTBEAT_WEBHOOK_SECRET is not configured.")
+
+    agent_id = AGENT_ID
+    if not agent_id:
+        agent = await _get("/agents/me")
+        if isinstance(agent, dict) and not agent.get("isError"):
+            agent_id = str(agent.get("id", "")).strip()
+    if not agent_id:
+        return _err("Could not resolve the Paperclip agent identity.")
+
+    result = await _post(f"/agents/{agent_id}/heartbeat/invoke")
+    if not isinstance(result, dict) or result.get("isError"):
+        return result if isinstance(result, dict) else _err("Could not start a Paperclip heartbeat run.")
+
+    run_id = str(result.get("id") or result.get("runId") or "").strip()
+    if not run_id:
+        return _err("Paperclip heartbeat invocation did not return a run ID.")
+    if not await _wait_for_run_webhook(run_id):
+        return _err(
+            f"Paperclip did not deliver heartbeat run {run_id} to the MCP webhook "
+            "within the startup window."
+        )
+    return run_id
+
+
+async def _finish_mutation_run(run_id: str) -> None:
+    """Release the HTTP adapter webhook after the mutation is audited."""
+    async with _run_events_lock:
+        event = _run_events.get(run_id)
+    if event:
+        event.set()
+
+
+async def _mutate(
+    method: str,
+    path: str,
+    *,
+    body: dict[str, Any] | None = None,
+) -> Any:
+    """Execute one mutating API call inside an attributed heartbeat run."""
+    async with _mutation_lock:
+        run = await _start_mutation_run()
+        if not isinstance(run, str):
+            return run
+        try:
+            return await _request(method, path, body=body, run_id=run)
+        finally:
+            await _finish_mutation_run(run)
+
+
 # ── Startup validation ─────────────────────────────────────────────────────────
 
 def _validate_config() -> None:
@@ -168,6 +246,35 @@ mcp = FastMCP(
     ),
     lifespan=_lifespan,
 )
+
+
+@mcp.custom_route("/paperclip-heartbeat", methods=["POST"])
+async def paperclip_heartbeat(request: Request) -> JSONResponse:
+    """Hold a Paperclip HTTP heartbeat open while an MCP mutation runs."""
+    if not HEARTBEAT_WEBHOOK_SECRET:
+        return JSONResponse({"error": "heartbeat webhook is not configured"}, status_code=503)
+    if request.headers.get("X-Paperclip-Heartbeat-Secret") != HEARTBEAT_WEBHOOK_SECRET:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    run_id = str(payload.get("runId", "")).strip()
+    if not run_id:
+        return JSONResponse({"error": "runId is required"}, status_code=400)
+
+    event = asyncio.Event()
+    async with _run_events_lock:
+        _run_events[run_id] = event
+    try:
+        await asyncio.wait_for(event.wait(), timeout=_HTTP_TIMEOUT)
+        return JSONResponse({"status": "completed", "runId": run_id})
+    except asyncio.TimeoutError:
+        return JSONResponse({"status": "timed_out", "runId": run_id}, status_code=504)
+    finally:
+        async with _run_events_lock:
+            _run_events.pop(run_id, None)
 
 
 # ── ISSUES ─────────────────────────────────────────────────────────────────────
@@ -241,7 +348,7 @@ async def create_issue(
         body["projectId"] = project_id
     if parent_issue_id:
         body["parentIssueId"] = parent_issue_id
-    return await _post(f"/companies/{COMPANY}/issues", body)
+    return await _mutate("POST", f"/companies/{COMPANY}/issues", body=body)
 
 
 @mcp.tool()
@@ -281,7 +388,7 @@ async def update_issue(
         body["priority"] = priority
     if not body:
         return _err("No fields to update. Provide at least one of: title, description, status, assignee_agent_id, priority.")
-    return await _patch(f"/issues/{issue_id}", body)
+    return await _mutate("PATCH", f"/issues/{issue_id}", body=body)
 
 
 @mcp.tool()
@@ -294,7 +401,7 @@ async def checkout_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or identifier to check out.
     """
-    return await _post(f"/issues/{issue_id}/checkout")
+    return await _mutate("POST", f"/issues/{issue_id}/checkout")
 
 
 @mcp.tool()
@@ -307,7 +414,7 @@ async def release_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or identifier to release.
     """
-    return await _post(f"/issues/{issue_id}/release")
+    return await _mutate("POST", f"/issues/{issue_id}/release")
 
 
 @mcp.tool()
@@ -327,7 +434,7 @@ async def comment_on_issue(
     payload: dict[str, Any] = {"body": body}
     if reopen:
         payload["reopen"] = True
-    return await _post(f"/issues/{issue_id}/comments", payload)
+    return await _mutate("POST", f"/issues/{issue_id}/comments", body=payload)
 
 
 @mcp.tool()
@@ -337,7 +444,7 @@ async def delete_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or identifier to delete.
     """
-    return await _delete(f"/issues/{issue_id}")
+    return await _mutate("DELETE", f"/issues/{issue_id}")
 
 
 # ── AGENTS ─────────────────────────────────────────────────────────────────────
@@ -395,7 +502,7 @@ async def create_goal(title: str, description: str = "") -> Any:
     body: dict[str, Any] = {"title": title}
     if description:
         body["description"] = description
-    return await _post(f"/companies/{COMPANY}/goals", body)
+    return await _mutate("POST", f"/companies/{COMPANY}/goals", body=body)
 
 
 @mcp.tool()
@@ -418,7 +525,7 @@ async def update_goal(
         body["description"] = description
     if not body:
         return _err("No fields to update. Provide at least one of: title, description.")
-    return await _patch(f"/goals/{goal_id}", body)
+    return await _mutate("PATCH", f"/goals/{goal_id}", body=body)
 
 
 # ── APPROVALS ──────────────────────────────────────────────────────────────────
@@ -449,7 +556,7 @@ async def approve(approval_id: str, comment: str = "") -> Any:
     body: dict[str, Any] = {}
     if comment:
         body["comment"] = comment
-    return await _post(f"/approvals/{approval_id}/approve", body)
+    return await _mutate("POST", f"/approvals/{approval_id}/approve", body=body)
 
 
 @mcp.tool()
@@ -463,7 +570,7 @@ async def reject(approval_id: str, comment: str = "") -> Any:
     body: dict[str, Any] = {}
     if comment:
         body["comment"] = comment
-    return await _post(f"/approvals/{approval_id}/reject", body)
+    return await _mutate("POST", f"/approvals/{approval_id}/reject", body=body)
 
 
 @mcp.tool()
@@ -478,7 +585,11 @@ async def request_approval_revision(approval_id: str, comment: str) -> Any:
     """
     if not comment.strip():
         return _err("A comment is required when requesting a revision.")
-    return await _post(f"/approvals/{approval_id}/request-revision", {"comment": comment})
+    return await _mutate(
+        "POST",
+        f"/approvals/{approval_id}/request-revision",
+        body={"comment": comment},
+    )
 
 
 # ── COSTS & MONITORING ─────────────────────────────────────────────────────────
