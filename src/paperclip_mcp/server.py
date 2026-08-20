@@ -57,7 +57,8 @@ log = logging.getLogger(__name__)
 # ── HTTP client ────────────────────────────────────────────────────────────────
 
 _HTTP_TIMEOUT = 30  # seconds
-_HEARTBEAT_WAIT_TIMEOUT = 15  # seconds to wait for Paperclip to deliver a run to the webhook
+_HEARTBEAT_WAIT_TIMEOUT = 15  # seconds to wait for a run to become active
+_HEARTBEAT_LEASE_SECONDS = 25  # keep the HTTP heartbeat run active for the mutation
 
 # A mutation is kept inside one heartbeat run at a time.  The HTTP adapter
 # calls the webhook below and remains pending until the mutation is complete.
@@ -143,14 +144,17 @@ async def _delete(path: str) -> Any:
     return await _request("DELETE", path)
 
 
-async def _wait_for_run_webhook(run_id: str) -> bool:
-    """Wait until Paperclip has delivered this run to the HTTP adapter route."""
+async def _wait_for_run_active(run_id: str) -> bool:
+    """Wait until Paperclip reports the heartbeat run as active."""
     deadline = asyncio.get_running_loop().time() + _HEARTBEAT_WAIT_TIMEOUT
     while asyncio.get_running_loop().time() < deadline:
-        async with _run_events_lock:
-            if run_id in _run_events:
+        run = await _get(f"/heartbeat-runs/{run_id}")
+        if isinstance(run, dict):
+            if run.get("status") == "running":
                 return True
-        await asyncio.sleep(0.05)
+            if run.get("status") in {"failed", "cancelled", "timed_out", "succeeded"}:
+                return False
+        await asyncio.sleep(0.25)
     return False
 
 
@@ -174,10 +178,9 @@ async def _start_mutation_run() -> str | dict[str, Any]:
     run_id = str(result.get("id") or result.get("runId") or "").strip()
     if not run_id:
         return _err("Paperclip heartbeat invocation did not return a run ID.")
-    if not await _wait_for_run_webhook(run_id):
+    if not await _wait_for_run_active(run_id):
         return _err(
-            f"Paperclip did not deliver heartbeat run {run_id} to the MCP webhook "
-            "within the startup window."
+            f"Paperclip heartbeat run {run_id} did not become active within the startup window."
         )
     return run_id
 
@@ -268,10 +271,10 @@ async def paperclip_heartbeat(request: Request) -> JSONResponse:
     async with _run_events_lock:
         _run_events[run_id] = event
     try:
-        await asyncio.wait_for(event.wait(), timeout=_HTTP_TIMEOUT)
+        await asyncio.wait_for(event.wait(), timeout=_HEARTBEAT_LEASE_SECONDS)
         return JSONResponse({"status": "completed", "runId": run_id})
     except asyncio.TimeoutError:
-        return JSONResponse({"status": "timed_out", "runId": run_id}, status_code=504)
+        return JSONResponse({"status": "completed", "runId": run_id})
     finally:
         async with _run_events_lock:
             _run_events.pop(run_id, None)
