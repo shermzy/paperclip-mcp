@@ -43,6 +43,8 @@ API_KEY: str  = os.environ.get("PAPERCLIP_API_KEY", "")
 COMPANY: str  = os.environ.get("PAPERCLIP_COMPANY_ID", "")
 AGENT_ID: str = os.environ.get("PAPERCLIP_AGENT_ID", "").strip()
 HEARTBEAT_WEBHOOK_SECRET: str = os.environ.get("PAPERCLIP_HEARTBEAT_WEBHOOK_SECRET", "")
+MANAGER_CONTEXT_ISSUE_ID: str = os.environ.get("PAPERCLIP_MANAGER_CONTEXT_ISSUE_ID", "").strip()
+ALLOWED_PROJECT_ID: str = os.environ.get("PAPERCLIP_ALLOWED_PROJECT_ID", "").strip()
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -162,6 +164,8 @@ async def _start_mutation_run() -> str | dict[str, Any]:
     """Start and bind a real Paperclip heartbeat run for one mutation."""
     if not HEARTBEAT_WEBHOOK_SECRET:
         return _err("PAPERCLIP_HEARTBEAT_WEBHOOK_SECRET is not configured.")
+    if not MANAGER_CONTEXT_ISSUE_ID:
+        return _err("PAPERCLIP_MANAGER_CONTEXT_ISSUE_ID is not configured.")
 
     agent_id = AGENT_ID
     if not agent_id:
@@ -171,7 +175,17 @@ async def _start_mutation_run() -> str | dict[str, Any]:
     if not agent_id:
         return _err("Could not resolve the Paperclip agent identity.")
 
-    result = await _post(f"/agents/{agent_id}/heartbeat/invoke")
+    result = await _post(
+        f"/agents/{agent_id}/heartbeat/invoke",
+        body={
+            "payload": {
+                "issueId": MANAGER_CONTEXT_ISSUE_ID,
+                "mutation": "mcp_manager",
+            },
+            "reason": "mcp_manager_mutation",
+            "triggerDetail": "system",
+        },
+    )
     if not isinstance(result, dict) or result.get("isError"):
         return result if isinstance(result, dict) else _err("Could not start a Paperclip heartbeat run.")
 
@@ -210,6 +224,28 @@ async def _mutate(
             await _finish_mutation_run(run)
 
 
+async def _ensure_issue_scope(issue_id: str) -> dict[str, Any] | None:
+    """Enforce the configured project boundary for issue reads and writes."""
+    if not ALLOWED_PROJECT_ID:
+        return None
+    issue = await _get(f"/issues/{issue_id}")
+    if not isinstance(issue, dict) or issue.get("isError"):
+        return issue if isinstance(issue, dict) else _err("Could not inspect the target issue.")
+    if issue.get("projectId") != ALLOWED_PROJECT_ID:
+        return _err(
+            f"Issue {issue.get('identifier', issue_id)} is outside the configured allowed project.",
+            status=403,
+        )
+    return None
+
+
+def _ensure_create_project_scope(project_id: str) -> dict[str, Any] | None:
+    """Require newly created issues to be placed in the allowed project."""
+    if ALLOWED_PROJECT_ID and project_id != ALLOWED_PROJECT_ID:
+        return _err("New issues must specify the configured allowed project.", status=403)
+    return None
+
+
 # ── Startup validation ─────────────────────────────────────────────────────────
 
 def _validate_config() -> None:
@@ -217,6 +253,8 @@ def _validate_config() -> None:
     missing = [k for k, v in {
         "PAPERCLIP_API_KEY": API_KEY,
         "PAPERCLIP_COMPANY_ID": COMPANY,
+        "PAPERCLIP_MANAGER_CONTEXT_ISSUE_ID": MANAGER_CONTEXT_ISSUE_ID,
+        "PAPERCLIP_ALLOWED_PROJECT_ID": ALLOWED_PROJECT_ID,
     }.items() if not v]
     if missing:
         log.error("Missing required environment variables: %s", ", ".join(missing))
@@ -301,11 +339,15 @@ async def list_issues(
         label: Label name to filter by. Leave empty to skip label filtering.
         limit: Maximum number of results to return (1–200). Default: 50.
     """
+    if ALLOWED_PROJECT_ID and project_id and project_id != ALLOWED_PROJECT_ID:
+        return _err("Issue listing is restricted to the configured allowed project.", status=403)
     params: dict[str, Any] = {"status": status, "limit": max(1, min(limit, 200))}
     if assignee_agent_id:
         params["assigneeAgentId"] = assignee_agent_id
     if project_id:
         params["projectId"] = project_id
+    elif ALLOWED_PROJECT_ID:
+        params["projectId"] = ALLOWED_PROJECT_ID
     if label:
         params["label"] = label
     return await _get(f"/companies/{COMPANY}/issues", params)
@@ -318,6 +360,9 @@ async def get_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or human-readable identifier (e.g. "CY-42").
     """
+    scope_error = await _ensure_issue_scope(issue_id)
+    if scope_error:
+        return scope_error
     return await _get(f"/issues/{issue_id}")
 
 
@@ -342,6 +387,9 @@ async def create_issue(
         parent_issue_id: UUID of the parent issue when creating a subtask. Leave empty for top-level.
         priority: Task priority — urgent, high, medium, or low. Default: medium.
     """
+    scope_error = _ensure_create_project_scope(project_id)
+    if scope_error:
+        return scope_error
     body: dict[str, Any] = {"title": title, "priority": priority}
     if description:
         body["description"] = description
@@ -391,6 +439,9 @@ async def update_issue(
         body["priority"] = priority
     if not body:
         return _err("No fields to update. Provide at least one of: title, description, status, assignee_agent_id, priority.")
+    scope_error = await _ensure_issue_scope(issue_id)
+    if scope_error:
+        return scope_error
     return await _mutate("PATCH", f"/issues/{issue_id}", body=body)
 
 
@@ -404,6 +455,9 @@ async def checkout_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or identifier to check out.
     """
+    scope_error = await _ensure_issue_scope(issue_id)
+    if scope_error:
+        return scope_error
     return await _mutate("POST", f"/issues/{issue_id}/checkout")
 
 
@@ -417,6 +471,9 @@ async def release_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or identifier to release.
     """
+    scope_error = await _ensure_issue_scope(issue_id)
+    if scope_error:
+        return scope_error
     return await _mutate("POST", f"/issues/{issue_id}/release")
 
 
@@ -437,6 +494,9 @@ async def comment_on_issue(
     payload: dict[str, Any] = {"body": body}
     if reopen:
         payload["reopen"] = True
+    scope_error = await _ensure_issue_scope(issue_id)
+    if scope_error:
+        return scope_error
     return await _mutate("POST", f"/issues/{issue_id}/comments", body=payload)
 
 
@@ -447,6 +507,9 @@ async def delete_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or identifier to delete.
     """
+    scope_error = await _ensure_issue_scope(issue_id)
+    if scope_error:
+        return scope_error
     return await _mutate("DELETE", f"/issues/{issue_id}")
 
 
