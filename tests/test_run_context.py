@@ -91,3 +91,24 @@ def test_issue_scope_rejects_issue_outside_allowed_project(monkeypatch):
 
     assert result["isError"] is True
     assert "allowed project" in result["message"]
+
+
+def test_wildcard_issue_scope_allows_any_project(monkeypatch):
+    server = load_server(monkeypatch)
+    server.ALLOWED_PROJECT_ID = "*"
+
+    async def fake_get(path, params=None):
+        return {"id": "issue-1", "identifier": "TAA-878", "projectId": "other-project"}
+
+    monkeypatch.setattr(server, "_get", fake_get)
+
+    result = asyncio.run(server._ensure_issue_scope("TAA-878"))
+
+    assert result is None
+
+
+def test_wildcard_create_project_scope_allows_any_project(monkeypatch):
+    server = load_server(monkeypatch)
+    server.ALLOWED_PROJECT_ID = "*"
+
+    assert server._ensure_create_project_scope("any-project") is None

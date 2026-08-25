@@ -226,7 +226,7 @@ async def _mutate(
 
 async def _ensure_issue_scope(issue_id: str) -> dict[str, Any] | None:
     """Enforce the configured project boundary for issue reads and writes."""
-    if not ALLOWED_PROJECT_ID:
+    if not ALLOWED_PROJECT_ID or ALLOWED_PROJECT_ID == "*":
         return None
     issue = await _get(f"/issues/{issue_id}")
     if not isinstance(issue, dict) or issue.get("isError"):
@@ -241,7 +241,7 @@ async def _ensure_issue_scope(issue_id: str) -> dict[str, Any] | None:
 
 def _ensure_create_project_scope(project_id: str) -> dict[str, Any] | None:
     """Require newly created issues to be placed in the allowed project."""
-    if ALLOWED_PROJECT_ID and project_id != ALLOWED_PROJECT_ID:
+    if ALLOWED_PROJECT_ID and ALLOWED_PROJECT_ID != "*" and project_id != ALLOWED_PROJECT_ID:
         return _err("New issues must specify the configured allowed project.", status=403)
     return None
 
@@ -339,14 +339,14 @@ async def list_issues(
         label: Label name to filter by. Leave empty to skip label filtering.
         limit: Maximum number of results to return (1–200). Default: 50.
     """
-    if ALLOWED_PROJECT_ID and project_id and project_id != ALLOWED_PROJECT_ID:
+    if ALLOWED_PROJECT_ID and ALLOWED_PROJECT_ID != "*" and project_id and project_id != ALLOWED_PROJECT_ID:
         return _err("Issue listing is restricted to the configured allowed project.", status=403)
     params: dict[str, Any] = {"status": status, "limit": max(1, min(limit, 200))}
     if assignee_agent_id:
         params["assigneeAgentId"] = assignee_agent_id
     if project_id:
         params["projectId"] = project_id
-    elif ALLOWED_PROJECT_ID:
+    elif ALLOWED_PROJECT_ID and ALLOWED_PROJECT_ID != "*":
         params["projectId"] = ALLOWED_PROJECT_ID
     if label:
         params["label"] = label
